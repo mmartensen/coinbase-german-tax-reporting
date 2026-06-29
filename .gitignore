@@ -1,0 +1,35 @@
+# ---------------------------------------------------------------------------
+# Personal / sensitive data — NEVER commit
+# ---------------------------------------------------------------------------
+# Coinbase exports, Trade Republic statements and generated reports contain
+# personal financial data (names, addresses, depot numbers, balances).
+input/*
+output/*
+!input/.gitkeep
+!output/.gitkeep
+
+# Defense in depth: never commit raw data / report files anywhere in the repo
+*.csv
+*.pdf
+*.xml
+
+# ---------------------------------------------------------------------------
+# Python
+# ---------------------------------------------------------------------------
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+env/
+.mypy_cache/
+.pytest_cache/
+.ruff_cache/
+
+# ---------------------------------------------------------------------------
+# OS / editor
+# ---------------------------------------------------------------------------
+.DS_Store
+.vscode/
+.idea/
+*.swp

@@ -278,6 +278,46 @@ def aggregate_disposals(disposals: list[Disposal]) -> list[dict]:
     return sorted(groups.values(), key=lambda g: g["date"])
 
 
+def filing_group(asset: str) -> str:
+    """Gruppierung für die Steuererklärung: BTC, ETH, alles andere 'Divers'."""
+    return asset if asset in ("BTC", "ETH") else "Divers"
+
+
+def filing_summary(pf: Portfolio) -> list[dict]:
+    """Je Position (ETH / BTC / Divers): G/V des Jahres, erstes
+    Anschaffungsdatum der veräußerten Bestände und letzter Verkauf.
+
+    Alle drei Positionen werden immer ausgewiesen, auch ohne Verkäufe
+    (dann mit 0,00 und ohne Datumsangaben).
+    """
+    groups: dict[str, dict] = {
+        name: {
+            "name": name,
+            "assets": set(),
+            "gain": Decimal(0),
+            "gain_short": Decimal(0),
+            "proceeds": Decimal(0),
+            "cost": Decimal(0),
+            "first_acquired": None,
+            "last_sold": None,
+        }
+        for name in ("ETH", "BTC", "Divers")
+    }
+    for d in pf.disposals:
+        g = groups[filing_group(d.asset)]
+        g["assets"].add(d.asset)
+        g["gain"] += d.gain
+        if d.short_term:
+            g["gain_short"] += d.gain
+        g["proceeds"] += d.proceeds
+        g["cost"] += d.cost
+        if g["first_acquired"] is None or d.acquired_on < g["first_acquired"]:
+            g["first_acquired"] = d.acquired_on
+        if g["last_sold"] is None or d.disposed_on > g["last_sold"]:
+            g["last_sold"] = d.disposed_on
+    return [groups["ETH"], groups["BTC"], groups["Divers"]]
+
+
 def fmt(d: Decimal, places: str = "0.01") -> str:
     q = d.quantize(Decimal(places))
     s = f"{q:,.{len(places.split('.')[1])}f}"
@@ -302,7 +342,49 @@ def render_report(pf: Portfolio, year: int) -> str:
     w("für Staking/Rewards der Marktwert bei Zufluss.")
     w("")
 
-    assets = sorted({d.asset for d in pf.disposals})
+    # --- Zusammenfassung für die Steuererklärung -----------------------------
+    summary = filing_summary(pf)
+    w("=" * 78)
+    w("  ZUSAMMENFASSUNG FÜR DIE STEUERERKLÄRUNG")
+    w("=" * 78)
+    w(
+        f"{'POSITION':<8}{'ERSTE ANSCH.':>14}{'LETZTER VERK.':>15}"
+        f"{'ERLÖS':>11}{'KOSTEN':>11}{'G/V':>10}{'G/V <1J':>10}"
+    )
+    for g in summary:
+        fa = f"{g['first_acquired']:%d.%m.%Y}" if g["first_acquired"] else "-"
+        ls = f"{g['last_sold']:%d.%m.%Y}" if g["last_sold"] else "-"
+        w(
+            f"{g['name']:<8}"
+            + fa.rjust(14)
+            + ls.rjust(15)
+            + fmt(g["proceeds"]).rjust(11)
+            + fmt(g["cost"]).rjust(11)
+            + fmt(g["gain"]).rjust(10)
+            + fmt(g["gain_short"]).rjust(10)
+        )
+        if g["name"] == "Divers" and g["assets"]:
+            w(f"{'':8}enthält: {', '.join(sorted(g['assets']))}")
+    total = sum((g["gain"] for g in summary), Decimal(0))
+    total_short = sum((g["gain_short"] for g in summary), Decimal(0))
+    w("-" * 79)
+    w(
+        f"{'GESAMT':<8}{'':>14}{'':>15}{'':>11}{'':>11}"
+        + fmt(total).rjust(10) + fmt(total_short).rjust(10)
+    )
+    w("")
+    w(f"Gesamtgewinn/-verlust aus Cryptogeschäften in {year} bei Coinbase: {fmt(total)} €")
+    w(f"Davon mit einer Haltedauer von weniger als einem Jahr:            {fmt(total_short)} €")
+    w("")
+    w("Erste Ansch. = ältestes Anschaffungsdatum der in " f"{year}")
+    w("veräußerten Bestände (FIFO). Letzter Verk. = letzte Veräußerung in "
+      f"{year}.")
+    w("")
+
+    assets = sorted(
+        {d.asset for d in pf.disposals},
+        key=lambda a: ({"ETH": 0, "BTC": 1}.get(a, 2), a),
+    )
     grand_gain = Decimal(0)
     grand_short = Decimal(0)
 
@@ -336,32 +418,19 @@ def render_report(pf: Portfolio, year: int) -> str:
         w(f"  Summe {asset}: G/V {fmt(a_gain)} €  |  davon < 1 Jahr {fmt(a_short)} €")
         w("")
 
-    w("=" * 78)
-    w("  GESAMT")
-    w("=" * 78)
-    w(f"  Gesamtgewinn/-verlust aus Kryptogeschäften {year}: {fmt(grand_gain)} €")
-    w(f"  davon Haltedauer < 1 Jahr (steuerpflichtig § 23): {fmt(grand_short)} €")
-    w(f"  davon Haltedauer > 1 Jahr (steuerfrei):           {fmt(grand_gain - grand_short)} €")
-    w("")
-
-    # --- Staking / Rewards (sonstige Einkünfte) -----------------------------
+    # --- Staking / Rewards (Fußnote) -----------------------------------------
     if pf.income:
-        w("=" * 78)
-        w("  STAKING- & REWARD-EINKÜNFTE (Marktwert bei Zufluss, § 22 EStG)")
-        w("=" * 78)
-        by_type: dict[str, Decimal] = defaultdict(Decimal)
-        by_asset: dict[str, Decimal] = defaultdict(Decimal)
-        for inc in pf.income:
-            by_type[inc.tx_type] += inc.value_eur
-            by_asset[inc.asset] += inc.value_eur
-        for t in sorted(by_type):
-            w(f"  {t:<35} {fmt(by_type[t]):>12} €")
-        w("  " + "-" * 50)
-        for a in sorted(by_asset):
-            w(f"  davon {a:<29} {fmt(by_asset[a]):>12} €")
-        total_income = sum(by_type.values(), Decimal(0))
-        w("  " + "-" * 50)
-        w(f"  {'Summe Einkünfte':<35} {fmt(total_income):>12} €")
+        total_income = sum((i.value_eur for i in pf.income), Decimal(0))
+        w("-" * 78)
+        w(f"Staking- und Reward-Einkünfte {year}: {fmt(total_income)} € (Marktwert bei")
+        w("Zufluss; zugleich Anschaffungskosten der erhaltenen Coins).")
+        if total_income < Decimal(256):
+            w("Unter der Freigrenze von 256 € (§ 22 Nr. 3 EStG), damit nicht")
+            w("einkommensteuerpflichtig.")
+        else:
+            w("Die Freigrenze von 256 € (§ 22 Nr. 3 EStG) ist überschritten - als")
+            w("sonstige Einkünfte anzugeben.")
+        w(f"Einzelaufstellung: staking_einkommen_{year}.csv")
         w("")
 
     if pf.warnings:
@@ -415,7 +484,10 @@ def write_csv_outputs(pf: Portfolio, out_dir: Path, year: int) -> None:
 
 def compute_totals(pf: Portfolio):
     """Liefert (assets, je-Asset-Events, Gesamt-G/V, Gesamt-G/V<1J)."""
-    assets = sorted({d.asset for d in pf.disposals})
+    assets = sorted(
+        {d.asset for d in pf.disposals},
+        key=lambda a: ({"ETH": 0, "BTC": 1}.get(a, 2), a),
+    )
     per_asset: dict[str, list[dict]] = {}
     grand_gain = Decimal(0)
     grand_short = Decimal(0)
@@ -427,8 +499,25 @@ def compute_totals(pf: Portfolio):
     return assets, per_asset, grand_gain, grand_short
 
 
+ASSET_NAMES = {
+    "BTC": "Bitcoin", "ETH": "Ethereum", "ADA": "Cardano", "AVAX": "Avalanche",
+    "DOT": "Polkadot", "EURC": "Euro Coin", "HBAR": "Hedera", "LINK": "Chainlink",
+    "LTC": "Litecoin", "SOL": "Solana", "SUI": "Sui", "SWFTC": "SwftCoin",
+    "UNI": "Uniswap", "XLM": "Stellar", "XRP": "XRP", "DOGE": "Dogecoin",
+    "MATIC": "Polygon", "SHIB": "Shiba Inu", "BCH": "Bitcoin Cash",
+}
+
+TX_LABELS = {"Sell": "VERKAUF", "Convert": "TAUSCH", "Retail Simple Dust": "VERKAUF"}
+
+
+def fmt_qty(d: Decimal) -> str:
+    """Stückzahl deutsch formatiert, ohne überflüssige Nachkomma-Nullen."""
+    s = f"{d:,.8f}".rstrip("0").rstrip(".")
+    return s.replace(",", "X").replace(".", ",").replace("X", ".")
+
+
 def write_pdf(pf: Portfolio, out_path: Path, year: int) -> bool:
-    """Erzeugt einen PDF-Report analog zum Trade-Republic Crypto Jahresauszug.
+    """Erzeugt einen PDF-Report im Stil des Trade-Republic Crypto Jahresauszugs.
 
     Gibt False zurück, falls fpdf2 nicht installiert ist.
     """
@@ -438,178 +527,250 @@ def write_pdf(pf: Portfolio, out_path: Path, year: int) -> bool:
         return False
 
     assets, per_asset, grand_gain, grand_short = compute_totals(pf)
+    summary = filing_summary(pf)
+    total_income = sum((i.value_eur for i in pf.income), Decimal(0))
 
-    # Spaltenbreiten (mm), Summe ~190 (A4 hoch, Rand 10)
-    cols = [
-        ("DATUM", 22, "L"),
-        ("MENGE", 30, "R"),
-        ("PREIS/STK", 24, "R"),
-        ("GEBÜHR", 20, "R"),
-        ("ERLÖS", 24, "R"),
-        ("KOSTEN", 24, "R"),
-        ("G/V", 23, "R"),
-        ("G/V <1J", 23, "R"),
-    ]
-
-    NAVY = (15, 32, 64)
-    GREY = (235, 237, 241)
+    GREY = (120, 120, 120)
     RED = (176, 0, 32)
-    GREEN = (0, 110, 60)
 
-    pdf = FPDF(orientation="P", unit="mm", format="A4")
-    pdf.set_auto_page_break(auto=True, margin=12)
-    pdf.set_margins(10, 12, 10)
+    class TRStylePDF(FPDF):
+        def footer(self):
+            self.set_y(-12)
+            self.set_font("Helvetica", "", 7)
+            self.set_text_color(*GREY)
+            self.cell(0, 4, f"Seite {self.page_no()} von {{nb}}", align="R")
+
+    pdf = TRStylePDF(orientation="P", unit="mm", format="A4")
+    # cp1252 statt latin-1, damit das Euro-Zeichen verfügbar ist
+    pdf.core_fonts_encoding = "windows-1252"
+    pdf.alias_nb_pages()
+    pdf.set_auto_page_break(auto=True, margin=16)
+    pdf.set_margins(12, 14, 12)
     pdf.add_page()
 
-    def gv_color(val: Decimal):
-        pdf.set_text_color(*(RED if val < 0 else GREEN if val > 0 else (0, 0, 0)))
+    content_w = pdf.w - pdf.l_margin - pdf.r_margin  # 186 mm
 
-    def header_row():
-        pdf.set_font("Helvetica", "B", 7.5)
-        pdf.set_fill_color(*NAVY)
-        pdf.set_text_color(255, 255, 255)
-        for title, wcol, _ in cols:
-            pdf.cell(wcol, 6, title, border=0, align="C", fill=True)
-        pdf.ln(6)
+    def hline(weight: float = 0.2):
+        pdf.set_line_width(weight)
+        pdf.set_draw_color(0, 0, 0)
+        y = pdf.get_y()
+        pdf.line(pdf.l_margin, y, pdf.w - pdf.r_margin, y)
+
+    def eur(d: Decimal) -> str:
+        return f"{fmt(d)} \u20ac"
+
+    def table_header(cols: list[tuple[str, str, float, str]]):
+        """Zweizeilige Spaltenköpfe im TR-Stil mit Linie darunter."""
+        pdf.set_font("Helvetica", "B", 6.3)
+        pdf.set_text_color(0, 0, 0)
+        x = pdf.l_margin
+        y = pdf.get_y()
+        for line1, line2, wcol, align in cols:
+            pdf.set_xy(x, y)
+            pdf.cell(wcol, 3.1, line1, align=align)
+            pdf.set_xy(x, y + 3.1)
+            pdf.cell(wcol, 3.1, line2, align=align)
+            x += wcol
+        pdf.set_y(y + 7.2)
+        hline(0.35)
+        pdf.ln(1.6)
+
+    # ============================ KOPF ============================
+    pdf.set_font("Helvetica", "B", 10)
+    pdf.cell(100, 5, "KRYPTO-STEUERREPORT", align="L")
+    pdf.set_font("Helvetica", "", 8)
+    pdf.cell(0, 5, f"DATUM {datetime.now():%d.%m.%Y}    STEUERJAHR {year}",
+             align="R", new_x="LMARGIN", new_y="NEXT")
+    pdf.set_font("Helvetica", "", 8)
+    pdf.set_text_color(*GREY)
+    pdf.cell(0, 4, "Quelle: Coinbase Transaktions-Export", align="L",
+             new_x="LMARGIN", new_y="NEXT")
+    pdf.set_text_color(0, 0, 0)
+    pdf.ln(6)
+
+    pdf.set_font("Helvetica", "B", 14)
+    pdf.cell(0, 7, "CRYPTO JAHRESAUSZUG", align="R", new_x="LMARGIN", new_y="NEXT")
+    pdf.set_font("Helvetica", "", 9)
+    pdf.cell(0, 5, f"zum 31.12.{year}", align="R", new_x="LMARGIN", new_y="NEXT")
+    pdf.ln(6)
+
+    # ======================= EINLEITUNG =======================
+    pdf.set_font("Helvetica", "B", 11)
+    pdf.cell(0, 6, "CRYPTO TRANSAKTIONEN", new_x="LMARGIN", new_y="NEXT")
+    pdf.ln(1)
+    pdf.set_font("Helvetica", "", 8)
+    for para in (
+        f"Nachfolgend findest du eine Aufstellung über die Crypto-Transaktionen in deinem "
+        f"Coinbase-Konto im Jahr {year}.",
+        "Die Gewinne und Verluste wurden nach dem First-In-First-Out-Prinzip ermittelt. "
+        "Veräußerungen mit einer Haltedauer von mehr als einem Jahr sind steuerfrei (§ 23 EStG).",
+        "Als Anschaffungskosten für Staking-Rewards wurde der Marktwert zum Zeitpunkt der "
+        "Einbuchung angesetzt. Krypto-zu-Krypto-Tausch (Convert) gilt als Veräußerung.",
+        "Bitte überprüfe, ob die Aufstellung korrekt ist.",
+    ):
+        pdf.multi_cell(0, 3.8, para)
+        pdf.ln(1)
+
+    pdf.set_text_color(*RED)
+    pdf.set_font("Helvetica", "B", 7.5)
+    pdf.multi_cell(
+        0, 3.6,
+        "KI-generiert. Kein offizielles Steuerdokument und keine Steuerberatung. Ohne Gewähr - "
+        "bitte vor Abgabe von einer/einem Steuerberater:in prüfen lassen.",
+    )
+    pdf.set_text_color(0, 0, 0)
+    pdf.ln(5)
+
+    # ======================= ZUSAMMENFASSUNG =======================
+    pdf.set_font("Helvetica", "B", 11)
+    pdf.cell(0, 6, "ZUSAMMENFASSUNG", new_x="LMARGIN", new_y="NEXT")
+    pdf.ln(1)
+
+    sum_cols = [
+        ("", "POSITION", 24, "L"),
+        ("ERSTE", "ANSCHAFFUNG", 30, "R"),
+        ("LETZTER", "VERKAUF", 28, "R"),
+        ("ERLÖS", "IN EUR", 26, "R"),
+        ("KOSTEN", "IN EUR", 26, "R"),
+        ("GEWINN/VERLUST", "IN EUR", 26, "R"),
+        ("GEWINN/VERLUST", "<1 JAHR IN EUR", 26, "R"),
+    ]
+    table_header(sum_cols)
+
+    pdf.set_font("Helvetica", "", 8)
+    for g in summary:
+        row = [
+            g["name"],
+            f"{g['first_acquired']:%d.%m.%Y}" if g["first_acquired"] else "-",
+            f"{g['last_sold']:%d.%m.%Y}" if g["last_sold"] else "-",
+            eur(g["proceeds"]),
+            eur(g["cost"]),
+            eur(g["gain"]),
+            eur(g["gain_short"]),
+        ]
+        for val, (_, _, wcol, align) in zip(row, sum_cols):
+            pdf.cell(wcol, 5.5, val, align=align)
+        pdf.ln(5.5)
+        if g["name"] == "Divers" and g["assets"]:
+            pdf.set_font("Helvetica", "I", 6.5)
+            pdf.set_text_color(*GREY)
+            pdf.cell(sum_cols[0][2], 3.6, "")
+            pdf.cell(0, 3.6, "enthält: " + ", ".join(sorted(g["assets"])),
+                     align="L", new_x="LMARGIN", new_y="NEXT")
+            pdf.set_text_color(0, 0, 0)
+            pdf.set_font("Helvetica", "", 8)
+    pdf.ln(0.5)
+    hline(0.35)
+    pdf.ln(1.2)
+    pdf.set_font("Helvetica", "B", 8)
+    pdf.cell(sum(c[2] for c in sum_cols[:-2]), 5.5, "", align="R")
+    pdf.cell(sum_cols[-2][2], 5.5, eur(grand_gain), align="R")
+    pdf.cell(sum_cols[-1][2], 5.5, eur(grand_short), align="R", new_x="LMARGIN", new_y="NEXT")
+    pdf.ln(6)
+
+    # TR-Stil: Gesamtzeilen
+    pdf.set_font("Helvetica", "B", 9)
+    pdf.cell(150, 5.5, f"Gesamtgewinn/-verlust aus Cryptogeschäften in {year} bei Coinbase:", align="L")
+    pdf.cell(0, 5.5, eur(grand_gain), align="R", new_x="LMARGIN", new_y="NEXT")
+    pdf.multi_cell(
+        150, 4.4,
+        "Davon Gewinn / Verlust aus Cryptogeschäften mit einer Haltedauer von "
+        "weniger als einem Jahr",
+        new_x="RIGHT", new_y="TOP",
+    )
+    pdf.cell(0, 4.4, eur(grand_short), align="R", new_x="LMARGIN", new_y="NEXT")
+    pdf.ln(8)
+
+    # Staking-Hinweis (Fußnote)
+    if pf.income:
+        pdf.set_font("Helvetica", "", 7)
+        pdf.set_text_color(*GREY)
+        note = (
+            f"Staking- und Reward-Einkünfte {year}: {eur(total_income)} (Marktwert bei Zufluss; "
+            "zugleich Anschaffungskosten der erhaltenen Coins). "
+        )
+        if total_income < Decimal(256):
+            note += (
+                "Der Betrag liegt unter der Freigrenze von 256 \u20ac (§ 22 Nr. 3 EStG) "
+                "und ist damit nicht einkommensteuerpflichtig."
+            )
+        else:
+            note += (
+                "Die Freigrenze von 256 \u20ac (§ 22 Nr. 3 EStG) ist überschritten - "
+                "der Betrag ist als sonstige Einkünfte anzugeben."
+            )
+        note += f" Einzelaufstellung: staking_einkommen_{year}.csv."
+        pdf.multi_cell(0, 3.4, note)
         pdf.set_text_color(0, 0, 0)
 
-    # --- Titel ---
-    pdf.set_font("Helvetica", "B", 16)
-    pdf.set_text_color(*NAVY)
-    pdf.cell(0, 9, f"Krypto-Steuerreport {year}", align="L", new_x="LMARGIN", new_y="NEXT")
-    pdf.set_font("Helvetica", "", 9)
-    pdf.set_text_color(90, 90, 90)
-    pdf.cell(0, 5, "Coinbase - private Veraeusserungsgeschaefte (FIFO)", new_x="LMARGIN", new_y="NEXT")
-    pdf.ln(2)
-
+    # =================== AB SEITE 2: DETAILS JE ASSET ===================
+    pdf.add_page()
+    pdf.set_font("Helvetica", "B", 11)
+    pdf.cell(0, 6, "CRYPTO TRANSAKTIONEN IM DETAIL", new_x="LMARGIN", new_y="NEXT")
+    pdf.set_font("Helvetica", "", 7.5)
+    pdf.set_text_color(*GREY)
+    pdf.cell(0, 4.5, "Alle Veräußerungen nach FIFO, zusammengefasst je Transaktion.",
+             new_x="LMARGIN", new_y="NEXT")
     pdf.set_text_color(0, 0, 0)
-    pdf.set_font("Helvetica", "", 8)
-    pdf.set_text_color(*RED)
-    pdf.set_font("Helvetica", "B", 8)
-    pdf.multi_cell(
-        0, 4,
-        "KI-generiert. Kein offizielles Steuerdokument und keine Steuerberatung. "
-        "Ohne Gewaehr - bitte vor Abgabe von einer/einem Steuerberater:in pruefen lassen.",
-    )
-    pdf.ln(1)
-    pdf.set_text_color(0, 0, 0)
-    pdf.set_font("Helvetica", "", 8)
-    intro = (
-        "Gewinne/Verluste nach First-In-First-Out (Paragraf 23 EStG). Haltedauer ueber 1 Jahr "
-        "ist steuerfrei. Anschaffungskosten = gezahlter Betrag inkl. Gebuehren/Spread; fuer "
-        "Staking/Rewards der Marktwert bei Zufluss."
-    )
-    pdf.multi_cell(0, 4, intro)
-    pdf.ln(2)
+    pdf.ln(4)
 
-    # --- Asset-Tabellen ---
+    det_cols = [
+        ("", "TRANSAKTION", 30, "L"),
+        ("NOMINALE", "IN STK.", 26, "R"),
+        ("PREIS PRO STÜCK", "IN EUR", 30, "R"),
+        ("GEBÜHREN", "IN EUR", 22, "R"),
+        ("GEBUCHT", "IN EUR", 26, "R"),
+        ("GEWINN/VERLUST", "IN EUR", 26, "R"),
+        ("GEWINN/VERLUST", "<1 JAHR IN EUR", 26, "R"),
+    ]
+
     for asset in assets:
         events = per_asset[asset]
         a_gain = sum((e["gain"] for e in events), Decimal(0))
         a_short = sum((e["gain_short"] for e in events), Decimal(0))
 
-        if pdf.get_y() > 250:
+        # Platz für Titel + Kopf + mind. eine Zeile + Summe
+        if pdf.get_y() > pdf.h - 60:
             pdf.add_page()
 
-        pdf.set_font("Helvetica", "B", 10)
-        pdf.set_text_color(*NAVY)
-        pdf.cell(0, 6, asset, new_x="LMARGIN", new_y="NEXT")
-        header_row()
+        long_name = ASSET_NAMES.get(asset)
+        title = f"{long_name.upper()} ({asset})" if long_name else asset
+        pdf.set_font("Helvetica", "B", 9.5)
+        pdf.cell(0, 6, title, new_x="LMARGIN", new_y="NEXT")
+        pdf.ln(0.5)
+        table_header(det_cols)
 
-        pdf.set_font("Helvetica", "", 7.5)
-        fill = False
         for e in events:
+            if pdf.get_y() > pdf.h - 30:
+                pdf.add_page()
+                table_header(det_cols)
             row = [
                 f"{e['date']:%d.%m.%Y}",
-                fmt(e["qty"], "0.00000001"),
-                fmt(e["price"]),
-                fmt(e["fee"]),
-                fmt(e["proceeds"]),
-                fmt(e["cost"]),
-                fmt(e["gain"]),
-                fmt(e["gain_short"]),
+                fmt_qty(e["qty"]),
+                eur(e["price"]),
+                eur(e["fee"]),
+                eur(e["proceeds"]),
+                eur(e["gain"]),
+                eur(e["gain_short"]),
             ]
-            pdf.set_fill_color(*GREY)
-            x0, y0 = pdf.get_x(), pdf.get_y()
-            for i, (val, (_, wcol, align)) in enumerate(zip(row, cols)):
-                if i == 6:
-                    gv_color(e["gain"])
-                elif i == 7:
-                    gv_color(e["gain_short"])
-                else:
-                    pdf.set_text_color(0, 0, 0)
-                pdf.cell(wcol, 5, val, border=0, align=align, fill=fill)
-            pdf.set_text_color(0, 0, 0)
-            pdf.ln(5)
-            fill = not fill
+            pdf.set_font("Helvetica", "", 7.5)
+            for val, (_, _, wcol, align) in zip(row, det_cols):
+                pdf.cell(wcol, 3.8, val, align=align)
+            pdf.ln(3.8)
+            pdf.set_font("Helvetica", "", 6.5)
+            pdf.cell(det_cols[0][2], 3.4, TX_LABELS.get(e["type"], e["type"].upper()),
+                     align="L", new_x="LMARGIN", new_y="NEXT")
+            pdf.ln(1.2)
 
-        # Asset-Summe
+        # Summe je Asset (TR-Stil: Beträge unter den G/V-Spalten)
+        pdf.ln(0.3)
+        hline(0.35)
+        pdf.ln(1.2)
         pdf.set_font("Helvetica", "B", 8)
-        pdf.set_text_color(0, 0, 0)
-        label_w = cols[0][1] + cols[1][1] + cols[2][1] + cols[3][1] + cols[4][1] + cols[5][1]
-        pdf.cell(label_w, 5.5, f"Summe {asset}", border="T", align="R")
-        gv_color(a_gain)
-        pdf.cell(cols[6][1], 5.5, fmt(a_gain), border="T", align="R")
-        gv_color(a_short)
-        pdf.cell(cols[7][1], 5.5, fmt(a_short), border="T", align="R")
-        pdf.set_text_color(0, 0, 0)
-        pdf.ln(8)
-
-    # --- Gesamtsumme ---
-    if pdf.get_y() > 245:
-        pdf.add_page()
-    pdf.set_fill_color(*NAVY)
-    pdf.set_text_color(255, 255, 255)
-    pdf.set_font("Helvetica", "B", 10)
-    pdf.cell(0, 7, "  GESAMT", fill=True, new_x="LMARGIN", new_y="NEXT")
-    pdf.ln(1)
-    pdf.set_text_color(0, 0, 0)
-    pdf.set_font("Helvetica", "", 9)
-
-    def total_line(label: str, value: Decimal, bold: bool = False):
-        pdf.set_font("Helvetica", "B" if bold else "", 9)
-        pdf.set_text_color(0, 0, 0)
-        pdf.cell(140, 6, label, align="L")
-        gv_color(value)
-        pdf.cell(0, 6, f"{fmt(value)} EUR", align="R", new_x="LMARGIN", new_y="NEXT")
-        pdf.set_text_color(0, 0, 0)
-
-    total_line(f"Gesamtgewinn/-verlust aus Kryptogeschaeften {year}", grand_gain, bold=True)
-    total_line("davon Haltedauer < 1 Jahr (steuerpflichtig Paragraf 23)", grand_short)
-    total_line("davon Haltedauer > 1 Jahr (steuerfrei)", grand_gain - grand_short)
-    pdf.ln(4)
-
-    # --- Staking / Rewards ---
-    if pf.income:
-        by_type: dict[str, Decimal] = defaultdict(Decimal)
-        by_asset: dict[str, Decimal] = defaultdict(Decimal)
-        for inc in pf.income:
-            by_type[inc.tx_type] += inc.value_eur
-            by_asset[inc.asset] += inc.value_eur
-
-        if pdf.get_y() > 230:
-            pdf.add_page()
-        pdf.set_fill_color(*NAVY)
-        pdf.set_text_color(255, 255, 255)
-        pdf.set_font("Helvetica", "B", 10)
-        pdf.cell(0, 7, "  STAKING- & REWARD-EINKUENFTE (Marktwert bei Zufluss, Paragraf 22 EStG)",
-                 fill=True, new_x="LMARGIN", new_y="NEXT")
-        pdf.ln(1)
-        pdf.set_text_color(0, 0, 0)
-        pdf.set_font("Helvetica", "", 9)
-        for t in sorted(by_type):
-            pdf.cell(140, 5.5, t, align="L")
-            pdf.cell(0, 5.5, f"{fmt(by_type[t])} EUR", align="R", new_x="LMARGIN", new_y="NEXT")
-        pdf.set_font("Helvetica", "I", 8)
-        pdf.set_text_color(90, 90, 90)
-        for a in sorted(by_asset):
-            pdf.cell(140, 5, f"   davon {a}", align="L")
-            pdf.cell(0, 5, f"{fmt(by_asset[a])} EUR", align="R", new_x="LMARGIN", new_y="NEXT")
-        total_income = sum(by_type.values(), Decimal(0))
-        pdf.set_font("Helvetica", "B", 9)
-        pdf.set_text_color(0, 0, 0)
-        pdf.cell(140, 6, "Summe Einkuenfte", border="T", align="L")
-        pdf.cell(0, 6, f"{fmt(total_income)} EUR", border="T", align="R", new_x="LMARGIN", new_y="NEXT")
+        pdf.cell(sum(c[2] for c in det_cols[:-2]), 5, "", align="R")
+        pdf.cell(det_cols[-2][2], 5, eur(a_gain), align="R")
+        pdf.cell(det_cols[-1][2], 5, eur(a_short), align="R", new_x="LMARGIN", new_y="NEXT")
+        pdf.ln(6)
 
     pdf.output(str(out_path))
     return True
